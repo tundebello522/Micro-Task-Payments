@@ -16,10 +16,14 @@
 (define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u113))
 (define-constant ERR_MILESTONE_NOT_COMPLETED (err u114))
 (define-constant ERR_ALL_MILESTONES_NOT_COMPLETED (err u115))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u116))
+(define-constant ERR_TEMPLATE_NOT_ACTIVE (err u117))
+(define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u118))
 
 (define-data-var task-counter uint u0)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var milestone-counter uint u0)
+(define-data-var template-counter uint u0)
 
 (define-map tasks
     uint
@@ -90,6 +94,34 @@
 (define-map task-milestone-list
     uint
     (list 20 uint)
+)
+
+(define-map task-templates
+    uint
+    {
+        creator: principal,
+        name: (string-ascii 50),
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        category: (string-ascii 30),
+        estimated-duration: uint,
+        difficulty-level: uint,
+        default-payment: uint,
+        tags: (list 5 (string-ascii 20)),
+        is-active: bool,
+        created-at: uint,
+        usage-count: uint,
+    }
+)
+
+(define-map user-templates
+    principal
+    (list 50 uint)
+)
+
+(define-map template-tasks
+    uint
+    (list 100 uint)
 )
 
 (define-public (create-task
@@ -587,4 +619,152 @@
         (update-assignee-rating creator rating)
         (ok true)
     )
+)
+
+;; Task Template System Functions
+(define-public (create-task-template
+        (name (string-ascii 50))
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (category (string-ascii 30))
+        (estimated-duration uint)
+        (difficulty-level uint)
+        (default-payment uint)
+        (tags (list 5 (string-ascii 20)))
+    )
+    (let (
+            (template-id (+ (var-get template-counter) u1))
+            (current-user-templates (default-to (list) (map-get? user-templates tx-sender)))
+        )
+        (asserts! (> default-payment u0) ERR_INSUFFICIENT_PAYMENT)
+        (asserts! (<= difficulty-level u5) ERR_INVALID_RATING)
+        (asserts! (>= difficulty-level u1) ERR_INVALID_RATING)
+        (asserts! (> estimated-duration u0) ERR_INVALID_STATUS)
+        (map-set task-templates template-id {
+            creator: tx-sender,
+            name: name,
+            title: title,
+            description: description,
+            category: category,
+            estimated-duration: estimated-duration,
+            difficulty-level: difficulty-level,
+            default-payment: default-payment,
+            tags: tags,
+            is-active: true,
+            created-at: stacks-block-height,
+            usage-count: u0,
+        })
+        (map-set user-templates tx-sender
+            (unwrap-panic (as-max-len? (append current-user-templates template-id) u50))
+        )
+        (var-set template-counter template-id)
+        (ok template-id)
+    )
+)
+
+(define-public (create-task-from-template
+        (template-id uint)
+        (deadline uint)
+        (custom-payment (optional uint))
+    )
+    (let (
+            (template (unwrap! (map-get? task-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+            (task-id (+ (var-get task-counter) u1))
+            (payment (default-to (get default-payment template) custom-payment))
+            (current-template-tasks (default-to (list) (map-get? template-tasks template-id)))
+        )
+        (asserts! (get is-active template) ERR_TEMPLATE_NOT_ACTIVE)
+        (asserts! (> payment u0) ERR_INSUFFICIENT_PAYMENT)
+        (asserts! (> deadline stacks-block-height) ERR_DEADLINE_PASSED)
+        (try! (stx-transfer? payment tx-sender (as-contract tx-sender)))
+        (map-set tasks task-id {
+            creator: tx-sender,
+            title: (get title template),
+            description: (get description template),
+            payment: payment,
+            deadline: deadline,
+            assignee: none,
+            status: "open",
+            created-at: stacks-block-height,
+            completed-at: none,
+            rating: none,
+        })
+        (map-set template-tasks template-id
+            (unwrap-panic (as-max-len? (append current-template-tasks task-id) u100))
+        )
+        (map-set task-templates template-id
+            (merge template { usage-count: (+ (get usage-count template) u1) })
+        )
+        (update-user-profile tx-sender u1 u0 u0)
+        (var-set task-counter task-id)
+        (ok task-id)
+    )
+)
+
+(define-public (update-template
+        (template-id uint)
+        (name (string-ascii 50))
+        (title (string-ascii 100))
+        (description (string-ascii 500))
+        (category (string-ascii 30))
+        (estimated-duration uint)
+        (difficulty-level uint)
+        (default-payment uint)
+        (tags (list 5 (string-ascii 20)))
+    )
+    (let ((template (unwrap! (map-get? task-templates template-id) ERR_TEMPLATE_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator template)) ERR_NOT_AUTHORIZED)
+        (asserts! (> default-payment u0) ERR_INSUFFICIENT_PAYMENT)
+        (asserts! (<= difficulty-level u5) ERR_INVALID_RATING)
+        (asserts! (>= difficulty-level u1) ERR_INVALID_RATING)
+        (asserts! (> estimated-duration u0) ERR_INVALID_STATUS)
+        (map-set task-templates template-id
+            (merge template {
+                name: name,
+                title: title,
+                description: description,
+                category: category,
+                estimated-duration: estimated-duration,
+                difficulty-level: difficulty-level,
+                default-payment: default-payment,
+                tags: tags,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-template-status (template-id uint))
+    (let ((template (unwrap! (map-get? task-templates template-id) ERR_TEMPLATE_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator template)) ERR_NOT_AUTHORIZED)
+        (map-set task-templates template-id
+            (merge template { is-active: (not (get is-active template)) })
+        )
+        (ok true)
+    )
+)
+
+;; Template Read-Only Functions
+(define-read-only (get-task-template (template-id uint))
+    (map-get? task-templates template-id)
+)
+
+(define-read-only (get-user-templates (user principal))
+    (map-get? user-templates user)
+)
+
+(define-read-only (get-template-tasks (template-id uint))
+    (map-get? template-tasks template-id)
+)
+
+(define-read-only (get-template-counter)
+    (var-get template-counter)
+)
+
+(define-read-only (get-templates-by-category (category (string-ascii 30)))
+    (ok category)
+)
+
+(define-read-only (get-popular-templates)
+    (ok "popular-templates")
 )
